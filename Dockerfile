@@ -21,5 +21,7 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/target/release/payment_detection_merchant_settlement_system /app/server
 
+EXPOSE 8000
+
 # Run it
 CMD ["./server"]
