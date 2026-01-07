@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sui_sdk = { git = "https://github.com/mystenlabs/sui", package = "sui-sdk"}
+# sui_sdk = "1.23.0"
 tokio = { version = "1.2", features = ["full"] }
 tokio-stream = "0.1" # Critical for gRPC streaming
 serde = { version = "1.0", features = ["derive"] }
@@ -16,6 +16,7 @@ rustls = { version = "0.23", features = ["ring"] }
 prost = "0.13"
 prost-types = "0.13"
 reqwest = { version = "0.13.1", features = ["json", "rustls-native-certs"] }
+sui-sdk = "0.0.0"
 
 [build-dependencies]
 tonic-build = "0.12"
