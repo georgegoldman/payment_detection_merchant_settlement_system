@@ -1,0 +1,21 @@
+[package]
+name = "payment_detection_merchant_settlement_system"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sui_sdk = { git = "https://github.com/mystenlabs/sui", package = "sui-sdk"}
+tokio = { version = "1.2", features = ["full"] }
+tokio-stream = "0.1" # Critical for gRPC streaming
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+fastcrypto = "0.1.9"
+tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots"] }
+rustls = { version = "0.23", features = ["ring"] }
+prost = "0.13"
+prost-types = "0.13"
+reqwest = { version = "0.13.1", features = ["json", "rustls-native-certs"] }
+
+[build-dependencies]
+tonic-build = "0.12"
