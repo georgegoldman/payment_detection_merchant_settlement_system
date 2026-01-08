@@ -126,9 +126,6 @@ impl MonitorManager {
         tokio::spawn(async move {
             println!("🚀 LOW LATENCY gRPC Stream Started.");
             let rpc_endpoint = "https://fullnode.mainnet.sui.io:443";
-            let my_address = "0xa35de887586ac1a9e644bc8f1b24a0d54c6eea66b8feef8bfd94297adde8d479";
-            let usdc_type =
-                "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
 
             loop {
                 // Check if we should stop (Kill Switch)
@@ -140,22 +137,21 @@ impl MonitorManager {
 
                 println!("⏳ Connecting to Sui RPC...");
 
-                // --- THE FIX IS HERE: Configure the Connection ---
+                // Configure the Connection
                 let channel_result = Endpoint::from_static(rpc_endpoint)
                     .tls_config(ClientTlsConfig::new().with_native_roots())
                     .unwrap()
                     .connect_timeout(Duration::from_secs(5))
-                    .keep_alive_timeout(Duration::from_secs(10)) // Ping often
-                    .keep_alive_while_idle(true) // Keep connection alive even when silent
-                    .http2_keep_alive_interval(Duration::from_secs(15)) // Prevent "GoAway" errors
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    .http2_keep_alive_interval(Duration::from_secs(15))
                     .connect()
                     .await;
 
                 match channel_result {
                     Ok(channel) => {
-                        // --- THE FIX IS HERE: Configure the Client ---
                         let mut client = SubscriptionServiceClient::new(channel)
-                            .max_decoding_message_size(usize::MAX); // Allow huge blocks
+                            .max_decoding_message_size(usize::MAX);
 
                         let request = tonic::Request::new(SubscribeCheckpointsRequest {
                             read_mask: Some(FieldMask {
@@ -177,53 +173,70 @@ impl MonitorManager {
 
                                 while let Ok(Some(msg)) = stream.message().await {
                                     if let Some(checkpoint) = msg.checkpoint {
-                                        // 1. Process Transactions
                                         for tx in checkpoint.transactions {
                                             for change in tx.balance_changes {
-                                                // Check for USDC + Your Address
-                                                let is_match = change.address.as_deref()
-                                                    == Some(my_address)
-                                                    && change.coin_type.as_deref()
-                                                        == Some(usdc_type);
+                                                if let Some(owner_address) = change.address.as_ref()
+                                                {
+                                                    let owner_lower = owner_address.to_lowercase();
 
-                                                if is_match {
-                                                    println!("🚨 FAST PAYMENT DETECTED!");
+                                                    // Optional: Check if token is USDC
+                                                    let is_usdc = change
+                                                        .coin_type
+                                                        .as_deref()
+                                                        .map(|t| t.to_lowercase().contains("usdc"))
+                                                        .unwrap_or(false);
 
-                                                    // 2. Create Event
-                                                    let event = InternalPaymentEvent {
-                                                        address: my_address.to_string(),
-                                                        amount: change
-                                                            .amount
-                                                            .unwrap_or_default()
-                                                            .to_string(), // protobuf uses Some(128)
-                                                        tx_digest: tx
-                                                            .digest
-                                                            .clone()
-                                                            .unwrap_or_default(),
-                                                        timestamp: checkpoint
-                                                            .summary
-                                                            .as_ref()
-                                                            .and_then(|s| s.timestamp.as_ref())
-                                                            .map(|t| {
-                                                                t.seconds * 1000
-                                                                    + (t.nanos as i64 / 1_000_000)
-                                                            })
-                                                            .unwrap_or(0),
-                                                        // as i64,
-                                                    };
+                                                    if is_usdc {
+                                                        // ---------------------------------------------------------
+                                                        // STEP 1: OPEN LOCK, CLONE CHANNELS, CLOSE LOCK IMMEDIATELY
+                                                        // ---------------------------------------------------------
+                                                        // We use a block { ... } to ensure the lock is dropped before await
+                                                        let targets = {
+                                                            let listeners_map =
+                                                                listeners_clone.read().unwrap();
+                                                            listeners_map.get(&owner_lower).cloned()
+                                                        };
 
-                                                    // 3. Dispatch to Channels
-                                                    let targets = {
-                                                        let map = listeners_clone.read().unwrap();
-                                                        map.get(my_address)
-                                                            .cloned()
-                                                            .unwrap_or_default()
-                                                    };
+                                                        // ---------------------------------------------------------
+                                                        // STEP 2: SEND ASYNC (Safe now because lock is gone)
+                                                        // ---------------------------------------------------------
+                                                        if let Some(channels) = targets {
+                                                            println!(
+                                                                "🚨 FAST PAYMENT DETECTED FOR: {}",
+                                                                owner_lower
+                                                            );
 
-                                                    for tx_channel in targets {
-                                                        let _ = tx_channel
-                                                            .send(Ok(event.clone()))
-                                                            .await;
+                                                            let event = InternalPaymentEvent {
+                                                                address: owner_lower.clone(),
+                                                                amount: change
+                                                                    .amount
+                                                                    .unwrap_or_default()
+                                                                    .to_string(),
+                                                                tx_digest: tx
+                                                                    .digest
+                                                                    .clone()
+                                                                    .unwrap_or_default(),
+                                                                timestamp: checkpoint
+                                                                    .summary
+                                                                    .as_ref()
+                                                                    .and_then(|s| {
+                                                                        s.timestamp.as_ref()
+                                                                    })
+                                                                    .map(|t| {
+                                                                        t.seconds * 1000
+                                                                            + (t.nanos as i64
+                                                                                / 1_000_000)
+                                                                    })
+                                                                    .unwrap_or(0),
+                                                            };
+
+                                                            for tx_channel in channels {
+                                                                // Now we can await safely!
+                                                                let _ = tx_channel
+                                                                    .send(Ok(event.clone()))
+                                                                    .await;
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -238,7 +251,6 @@ impl MonitorManager {
                     Err(e) => println!("❌ Failed to connect: {:?}. Retrying...", e),
                 }
 
-                // Wait before reconnecting
                 sleep(Duration::from_secs(1)).await;
             }
         });

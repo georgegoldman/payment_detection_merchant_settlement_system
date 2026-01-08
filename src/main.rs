@@ -10,12 +10,11 @@ use indexer_layer::MonitorManager;
 
 // 2. Import generated proto code
 pub mod payment {
-    tonic::include_proto!("payment"); // Must match package name in .proto
+    tonic::include_proto!("payment");
 }
 use payment::payment_service_server::{PaymentService, PaymentServiceServer};
 use payment::{PaymentEvent, WatchRequest};
 
-// 3. Define the Service Struct
 pub struct MyPaymentService {
     manager: Arc<MonitorManager>,
 }
@@ -33,45 +32,60 @@ impl PaymentService for MyPaymentService {
 
         println!("🆕 New Client Watching: {}", address);
 
+        // Channel to send data to the Client (Tonic)
         let (tx, rx) = mpsc::channel(4);
+        // Channel to receive data from the Monitor
         let (internal_tx, mut internal_rx) = mpsc::channel(4);
 
         // 1. Register with Engine
         self.manager.add_listener(address.clone(), internal_tx);
 
-        // 2. Clone the manager so we can call 'remove' later
         let manager_clone = self.manager.clone();
         let address_clone = address.clone();
 
-        // 3. Spawn the task with a Drop Guard
+        // 2. Spawn task with "Active Watch" logic
         tokio::spawn(async move {
-            // This logic runs when the client connects
-            while let Some(res) = internal_rx.recv().await {
-                match res {
-                    Ok(event) => {
-                        let proto_event = PaymentEvent {
-                            tx_digest: event.tx_digest,
-                            amount: event.amount,
-                            token: "USDC".to_string(),
-                            timestamp: event.timestamp,
-                        };
-                        // If sending fails, it means Client disconnected (Ctrl+C)
-                        if tx.send(Ok(proto_event)).await.is_err() {
-                            break;
+            loop {
+                // 👇 THIS IS THE MAGIC FIX: "SELECT!"
+                // It waits for EITHER a payment OR a disconnect signal.
+                tokio::select! {
+                    // OPTION A: We received a payment from the blockchain
+                    maybe_event = internal_rx.recv() => {
+                        match maybe_event {
+                            Some(res) => {
+                                match res {
+                                    Ok(event) => {
+                                        let proto_event = PaymentEvent {
+                                            tx_digest: event.tx_digest,
+                                            amount: event.amount,
+                                            token: "USDC".to_string(),
+                                            timestamp: event.timestamp,
+                                        };
+                                        // If sending fails, client is gone
+                                        if tx.send(Ok(proto_event)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e)).await;
+                                    }
+                                }
+                            }
+                            None => break, // Monitor channel closed
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+
+                    // OPTION B: The Client disconnected (Ctrl+C detected!)
+                    _ = tx.closed() => {
+                        println!("🔌 Client disconnected from {}", address_clone);
+                        break;
                     }
                 }
             }
 
             // --- CLEANUP SECTION ---
-            // This runs automatically when the loop breaks (Ctrl+C or error)
-            println!(
-                "🔌 Client disconnected from {}. Cleaning up...",
-                address_clone
-            );
+            // This runs immediately when the loop breaks
+            println!("🧹 Removing listener for: {}", address_clone);
             manager_clone.remove_listener(&address_clone);
         });
 
@@ -81,14 +95,16 @@ impl PaymentService for MyPaymentService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // This line registers the "Ring" encryption provider so rustls doesn't crash.
+    // Rustls Crypto Fix
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
+
+    // Port Configuration
     let port = env::var("PORT").unwrap_or_else(|_| "50051".to_string());
     let addr = format!("0.0.0.0:{}", port).parse()?;
 
-    // Initialize the Engine
+    // Initialize Engine
     let manager = Arc::new(MonitorManager::new());
 
     let service = MyPaymentService {
@@ -97,7 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🚀 Payment gRPC Server running on {}", addr);
 
+    // Build Server (with HTTP/1 support for future web use)
     Server::builder()
+        .accept_http1(true)
         .add_service(PaymentServiceServer::new(service))
         .serve(addr)
         .await?;
